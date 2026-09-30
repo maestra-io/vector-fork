@@ -14,7 +14,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 env:
   ECR_REGISTRY: 515260921971.dkr.ecr.us-west-2.amazonaws.com
@@ -57,6 +56,10 @@ jobs:
   image:
     needs: test
     if: github.event_name != 'pull_request'
+    # OIDC only here: the test job runs PR code (build scripts, tests).
+    permissions:
+      contents: read
+      id-token: write
     runs-on: ubuntu-latest
     timeout-minutes: 350
     concurrency:
