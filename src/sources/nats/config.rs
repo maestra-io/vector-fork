@@ -1,10 +1,11 @@
 use async_nats::jetstream::{
-    consumer::StreamError as ConsumerStreamError, context::GetStreamError,
+    consumer::{AckPolicy, StreamError as ConsumerStreamError},
+    context::GetStreamError,
 };
 use snafu::{ResultExt, Snafu};
 use vector_lib::{
     codecs::decoding::{DeserializerConfig, FramingConfig},
-    config::{LegacyKey, LogNamespace},
+    config::{LegacyKey, LogNamespace, SourceAcknowledgementsConfig},
     configurable::configurable_component,
     lookup::{lookup_v2::OptionalValuePath, owned_value_path},
 };
@@ -39,6 +40,10 @@ pub enum BuildError {
     Consumer { source: async_nats::Error },
     #[snafu(display("Failed to retrieve messages from NATS consumer: {}", source))]
     Messages { source: ConsumerStreamError },
+    #[snafu(display(
+        "NATS consumer uses the {policy:?} ack policy; end-to-end acknowledgements require Explicit"
+    ))]
+    ConsumerAckPolicy { policy: AckPolicy },
 }
 
 /// Batch settings for a JetStream pull consumer.
@@ -85,6 +90,13 @@ pub struct JetStreamConfig {
     /// The name of the stream to bind to.
     pub stream: String,
     /// The name of the durable consumer to pull from.
+    ///
+    /// When end-to-end acknowledgements are enabled, the consumer must use the `explicit` ack
+    /// policy. A message is acknowledged only after every connected sink has accepted its events
+    /// (for a sink with a disk buffer, after the buffer write), so the consumer's `ack_wait` must
+    /// cover the worst-case time from delivery to that point, or the message is redelivered.
+    /// Messages rejected by a sink are terminated; errored ones are negatively acknowledged for
+    /// redelivery, bounded by the consumer's `max_deliver`.
     pub consumer: String,
 
     #[serde(default)]
@@ -205,8 +217,11 @@ impl SourceConfig for NatsSourceConfig {
 
         match self.mode() {
             NatsMode::JetStream(js_config) => {
+                let acknowledgements =
+                    cx.do_acknowledgements(SourceAcknowledgementsConfig::DEFAULT);
                 let connection = self.connect().await?;
-                let messages = create_consumer_stream(&connection, js_config).await?;
+                let messages =
+                    create_consumer_stream(&connection, js_config, acknowledgements).await?;
 
                 Ok(Box::pin(run_nats_jetstream(
                     self.clone(),
@@ -216,6 +231,7 @@ impl SourceConfig for NatsSourceConfig {
                     log_namespace,
                     cx.shutdown,
                     cx.out,
+                    acknowledgements,
                 )))
             }
             NatsMode::Core => {
@@ -261,7 +277,7 @@ impl SourceConfig for NatsSourceConfig {
 
     // Acknowledgment is only possible with Jetstream.
     fn can_acknowledge(&self) -> bool {
-        true
+        self.jetstream.is_some()
     }
 }
 
@@ -323,6 +339,15 @@ mod tests {
     #[test]
     fn generate_config() {
         crate::test_util::test_generate_config::<NatsSourceConfig>();
+    }
+
+    #[test]
+    fn only_jetstream_can_acknowledge() {
+        let mut config = NatsSourceConfig::default();
+        assert!(!config.can_acknowledge());
+
+        config.jetstream = Some(JetStreamConfig::default());
+        assert!(config.can_acknowledge());
     }
 
     #[test]

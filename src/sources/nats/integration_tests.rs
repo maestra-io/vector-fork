@@ -877,7 +877,7 @@ async fn nats_jetstream_shutdown_during_recovery() {
 
     let connection = conf.connect().await.unwrap();
     let js_config = conf.jetstream.clone().unwrap();
-    let initial_messages = create_consumer_stream(&connection, &js_config)
+    let initial_messages = create_consumer_stream(&connection, &js_config, false)
         .await
         .unwrap();
 
@@ -899,6 +899,7 @@ async fn nats_jetstream_shutdown_during_recovery() {
         LogNamespace::Legacy,
         shutdown_signal,
         tx,
+        false,
     ));
 
     // Deliver one message to prove the source is running.
@@ -1006,7 +1007,7 @@ async fn nats_jetstream_shutdown_during_consumption() {
 
     let connection = conf.connect().await.unwrap();
     let js_config = conf.jetstream.clone().unwrap();
-    let initial_messages = create_consumer_stream(&connection, &js_config)
+    let initial_messages = create_consumer_stream(&connection, &js_config, false)
         .await
         .unwrap();
 
@@ -1028,6 +1029,7 @@ async fn nats_jetstream_shutdown_during_consumption() {
         LogNamespace::Legacy,
         shutdown_signal,
         tx,
+        false,
     ));
 
     // Deliver one message to prove the source is actively consuming a healthy stream.
@@ -1178,4 +1180,285 @@ async fn nats_jetstream_backoff_resets_after_recovery() {
         "Second recovery took {:?}, suggesting backoff did not reset",
         round2_elapsed
     );
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end acknowledgements: a JetStream message is acked only once its
+// events are finalized downstream.
+// ---------------------------------------------------------------------------
+
+/// A stream plus a durable consumer with a short `ack_wait`, and a source config
+/// bound to them.
+async fn e2e_ack_setup(
+    prefix: &str,
+    ack_policy: async_nats::jetstream::consumer::AckPolicy,
+) -> (
+    async_nats::jetstream::Context,
+    async_nats::jetstream::consumer::PullConsumer,
+    NatsSourceConfig,
+) {
+    let url = std::env::var("NATS_JETSTREAM_ADDRESS")
+        .unwrap_or_else(|_| "nats://localhost:4222".to_string());
+    let (subject, stream_name, consumer_name) = random_jetstream_id(prefix);
+    let client = async_nats::connect(&url).await.unwrap();
+    let js = async_nats::jetstream::new(client);
+    let stream = js
+        .get_or_create_stream(async_nats::jetstream::stream::Config {
+            name: stream_name.clone(),
+            subjects: vec![subject.clone()],
+            storage: StorageType::Memory,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let consumer = stream
+        .create_consumer(async_nats::jetstream::consumer::pull::Config {
+            durable_name: Some(consumer_name.clone()),
+            ack_policy,
+            ack_wait: std::time::Duration::from_secs(2),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mut conf = generate_source_config(&url, &subject);
+    conf.jetstream = Some(JetStreamConfig {
+        stream: stream_name,
+        consumer: consumer_name,
+        ..Default::default()
+    });
+    (js, consumer, conf)
+}
+
+async fn e2e_publish(js: &async_nats::jetstream::Context, subject: &str, payload: String) {
+    js.publish(subject.to_owned(), Bytes::from(payload))
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+}
+
+type E2eOutput = futures::stream::BoxStream<'static, crate::event::Event>;
+
+async fn e2e_source(
+    conf: &NatsSourceConfig,
+    acknowledgements: bool,
+) -> (tokio::task::JoinHandle<Result<(), ()>>, E2eOutput) {
+    use futures::StreamExt;
+
+    let (tx, rx) = SourceSender::new_test();
+    let mut cx = SourceContext::new_test(tx, None);
+    cx.acknowledgements = acknowledgements;
+    let source = conf.build(cx).await.unwrap();
+    (tokio::spawn(source), rx.boxed())
+}
+
+async fn e2e_next(rx: &mut E2eOutput) -> crate::event::Event {
+    use futures::StreamExt;
+
+    tokio::time::timeout(std::time::Duration::from_secs(15), rx.next())
+        .await
+        .expect("timed out waiting for an event")
+        .expect("source output closed")
+}
+
+fn e2e_message(event: &crate::event::Event) -> String {
+    event.as_log()[log_schema().message_key().unwrap().to_string()]
+        .to_string_lossy()
+        .into_owned()
+}
+
+async fn e2e_wait_settled(consumer: &async_nats::jetstream::consumer::PullConsumer) {
+    let mut consumer = consumer.clone();
+    for _ in 0..100 {
+        let info = consumer.info().await.unwrap();
+        if info.num_ack_pending == 0 && info.num_pending == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!(
+        "consumer still has pending messages: {:?}",
+        consumer.info().await.unwrap()
+    );
+}
+
+/// Delivered acks, Rejected terminates (no poison loop), Errored redelivers.
+#[tokio::test]
+async fn nats_jetstream_acks_follow_downstream_status() {
+    use async_nats::jetstream::consumer::AckPolicy;
+    use futures::StreamExt;
+
+    use crate::event::EventStatus;
+
+    let (js, consumer, conf) = e2e_ack_setup("js_e2e_status", AckPolicy::Explicit).await;
+    let (handle, mut rx) = e2e_source(&conf, true).await;
+    let mut probe = consumer.clone();
+
+    // Not acked on read: pending until the sink says Delivered.
+    e2e_publish(&js, &conf.subject, "delivered".into()).await;
+    let event = e2e_next(&mut rx).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(probe.info().await.unwrap().num_ack_pending, 1);
+    event.metadata().update_status(EventStatus::Delivered);
+    drop(event);
+    e2e_wait_settled(&consumer).await;
+    assert_eq!(probe.info().await.unwrap().ack_floor.stream_sequence, 1);
+
+    // Rejected: terminated, never redelivered although ack_wait (2s) passes.
+    e2e_publish(&js, &conf.subject, "rejected".into()).await;
+    let event = e2e_next(&mut rx).await;
+    assert_eq!(e2e_message(&event), "rejected");
+    event.metadata().update_status(EventStatus::Rejected);
+    drop(event);
+    e2e_wait_settled(&consumer).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(4), rx.next())
+            .await
+            .is_err(),
+        "a rejected message must not be redelivered"
+    );
+
+    // Errored: NAKed with a delay and redelivered, then acked once delivered.
+    e2e_publish(&js, &conf.subject, "errored".into()).await;
+    let event = e2e_next(&mut rx).await;
+    event.metadata().update_status(EventStatus::Errored);
+    drop(event);
+    let event = e2e_next(&mut rx).await;
+    assert_eq!(e2e_message(&event), "errored");
+    event.metadata().update_status(EventStatus::Delivered);
+    drop(event);
+    e2e_wait_settled(&consumer).await;
+
+    handle.abort();
+}
+
+/// The crash test: vector reads messages and dies before any sink wrote them.
+/// With acknowledgements every message is redelivered to the next vector; with
+/// the old ack-on-read (acknowledgements off) the message is gone.
+#[tokio::test]
+async fn nats_jetstream_crash_between_read_and_sink_write_loses_nothing() {
+    use std::collections::BTreeSet;
+
+    use async_nats::jetstream::consumer::AckPolicy;
+
+    use crate::event::EventStatus;
+
+    const N: usize = 50;
+    let (js, consumer, conf) = e2e_ack_setup("js_e2e_crash", AckPolicy::Explicit).await;
+    let mut probe = consumer.clone();
+    for i in 0..N {
+        e2e_publish(&js, &conf.subject, format!("m{i}")).await;
+    }
+
+    // First vector: reads all N, then is killed before the sink writes anything.
+    let (handle, mut rx) = e2e_source(&conf, true).await;
+    let mut in_flight = Vec::new();
+    for _ in 0..N {
+        in_flight.push(e2e_next(&mut rx).await);
+    }
+    handle.abort();
+    handle.await.ok();
+    // A killed process never finalizes its in-flight events.
+    std::mem::forget(in_flight);
+    drop(rx);
+    assert_eq!(probe.info().await.unwrap().num_ack_pending, N);
+
+    // Second vector: after ack_wait every message comes back and is acked once delivered.
+    let (handle, mut rx) = e2e_source(&conf, true).await;
+    let mut seen = BTreeSet::new();
+    while seen.len() < N {
+        let event = e2e_next(&mut rx).await;
+        seen.insert(e2e_message(&event));
+        event.metadata().update_status(EventStatus::Delivered);
+    }
+    let expected: BTreeSet<String> = (0..N).map(|i| format!("m{i}")).collect();
+    assert_eq!(seen, expected, "lost messages after the crash");
+    e2e_wait_settled(&consumer).await;
+    handle.abort();
+    handle.await.ok();
+
+    // Contrast: without acknowledgements the message is acked on read, so the same
+    // crash loses it: nothing stays pending for redelivery.
+    e2e_publish(&js, &conf.subject, "lost".into()).await;
+    let (handle, mut rx) = e2e_source(&conf, false).await;
+    let event = e2e_next(&mut rx).await;
+    assert_eq!(e2e_message(&event), "lost");
+    e2e_wait_settled(&consumer).await;
+    handle.abort();
+    std::mem::forget(event);
+}
+
+/// A graceful shutdown acks what the topology still flushes after the source stops.
+#[tokio::test]
+async fn nats_jetstream_shutdown_acks_in_flight_events() {
+    use async_nats::jetstream::consumer::AckPolicy;
+
+    use crate::{
+        event::EventStatus,
+        sources::nats::source::{create_consumer_stream, run_nats_jetstream},
+    };
+
+    let (js, consumer, conf) = e2e_ack_setup("js_e2e_shutdown", AckPolicy::Explicit).await;
+    e2e_publish(&js, &conf.subject, "in flight".into()).await;
+
+    let connection = conf.connect().await.unwrap();
+    let messages = create_consumer_stream(&connection, conf.jetstream.as_ref().unwrap(), true)
+        .await
+        .unwrap();
+    let decoder = DecodingConfig::new(
+        conf.framing.clone(),
+        conf.decoding.clone(),
+        LogNamespace::Legacy,
+    )
+    .build()
+    .unwrap();
+    let (shutdown_trigger, shutdown_signal, shutdown_done) = ShutdownSignal::new_wired();
+    let (tx, rx) = SourceSender::new_test();
+    let mut rx: E2eOutput = futures::StreamExt::boxed(rx);
+    let handle = tokio::spawn(run_nats_jetstream(
+        conf.clone(),
+        connection,
+        messages,
+        decoder,
+        LogNamespace::Legacy,
+        shutdown_signal,
+        tx,
+        true,
+    ));
+
+    let event = e2e_next(&mut rx).await;
+    shutdown_trigger.cancel();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!handle.is_finished(), "source must wait for in-flight acks");
+    event.metadata().update_status(EventStatus::Delivered);
+    drop(event);
+
+    handle.await.unwrap().expect("source failed");
+    shutdown_done.await;
+    e2e_wait_settled(&consumer).await;
+}
+
+/// Unordered finalization with a cumulative (`all`) ack policy could ack a failed message.
+#[tokio::test]
+async fn nats_jetstream_acknowledgements_require_explicit_ack_policy() {
+    use async_nats::jetstream::consumer::AckPolicy;
+
+    let (_js, _consumer, conf) = e2e_ack_setup("js_e2e_policy", AckPolicy::All).await;
+    let (tx, _rx) = SourceSender::new_test();
+    let mut cx = SourceContext::new_test(tx, None);
+    cx.acknowledgements = true;
+    let error = match conf.build(cx).await {
+        Ok(_) => panic!("expected the ack policy to be refused"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error.downcast_ref::<BuildError>(),
+        Some(BuildError::ConsumerAckPolicy {
+            policy: AckPolicy::All
+        })
+    ));
+
+    // Without end-to-end acknowledgements the policy does not matter.
+    let (tx, _rx) = SourceSender::new_test();
+    assert!(conf.build(SourceContext::new_test(tx, None)).await.is_ok());
 }
