@@ -1462,3 +1462,49 @@ async fn nats_jetstream_acknowledgements_require_explicit_ack_policy() {
     let (tx, _rx) = SourceSender::new_test();
     assert!(conf.build(SourceContext::new_test(tx, None)).await.is_ok());
 }
+
+/// A payload that does not decode at all is terminated (no poison loop); a
+/// partly decoded one follows the status of the events it did send.
+#[tokio::test]
+async fn nats_jetstream_decode_failures() {
+    use async_nats::jetstream::consumer::AckPolicy;
+    use futures::StreamExt;
+
+    use crate::event::EventStatus;
+
+    let (js, consumer, mut conf) = e2e_ack_setup("js_e2e_decode", AckPolicy::Explicit).await;
+    conf.framing =
+        serde_json::from_value(serde_json::json!({"method": "newline_delimited"})).unwrap();
+    conf.decoding = serde_json::from_value(serde_json::json!({"codec": "json"})).unwrap();
+    let (handle, mut rx) = e2e_source(&conf, true).await;
+
+    // Nothing decodes: terminated at once, never redelivered.
+    e2e_publish(&js, &conf.subject, "not json\n".into()).await;
+    e2e_wait_settled(&consumer).await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(4), rx.next())
+            .await
+            .is_err(),
+        "an undecodable message must not be redelivered"
+    );
+
+    // Two good frames around a bad one: an errored good frame gets the message redelivered.
+    e2e_publish(
+        &js,
+        &conf.subject,
+        "{\"n\":1}\nnot json\n{\"n\":2}\n".into(),
+    )
+    .await;
+    let first = e2e_next(&mut rx).await;
+    let second = e2e_next(&mut rx).await;
+    first.metadata().update_status(EventStatus::Errored);
+    second.metadata().update_status(EventStatus::Delivered);
+    drop((first, second));
+    for _ in 0..2 {
+        let event = e2e_next(&mut rx).await;
+        event.metadata().update_status(EventStatus::Delivered);
+    }
+    e2e_wait_settled(&consumer).await;
+
+    handle.abort();
+}

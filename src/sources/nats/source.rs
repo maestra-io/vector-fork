@@ -38,8 +38,9 @@ use crate::{
 pub enum ProcessingStatus {
     /// The message payload was fully decoded and sent downstream.
     Success,
-    /// A non-recoverable error occurred while decoding the payload.
-    Failed,
+    /// Part of the payload failed to decode; `sent` tells whether other
+    /// frames of it were already sent downstream.
+    Failed { sent: bool },
     /// The downstream channel is closed, and the source should shut down.
     ChannelClosed,
 }
@@ -58,6 +59,7 @@ pub async fn process_message(
 ) -> ProcessingStatus {
     let mut framed = DecoderFramedRead::new(msg.payload.as_ref(), decoder.clone());
     let mut success = true;
+    let mut sent = false;
 
     while let Some(next) = framed.next().await {
         match next {
@@ -97,6 +99,7 @@ pub async fn process_message(
                     emit!(StreamClosedError { count });
                     return ProcessingStatus::ChannelClosed;
                 }
+                sent = true;
             }
             Err(error) => {
                 success = false;
@@ -112,7 +115,7 @@ pub async fn process_message(
     if success {
         ProcessingStatus::Success
     } else {
-        ProcessingStatus::Failed
+        ProcessingStatus::Failed { sent }
     }
 }
 
@@ -256,7 +259,10 @@ pub async fn run_nats_jetstream(
                             drop(batch);
 
                             match status {
-                                ProcessingStatus::Success => match (&finalizer, receiver) {
+                                // A partly decoded message follows its sent events: the
+                                // frames that failed to decode are dropped (and logged).
+                                ProcessingStatus::Success
+                                | ProcessingStatus::Failed { sent: true } => match (&finalizer, receiver) {
                                     (Some(finalizer), Some(receiver)) => {
                                         let (stream_sequence, delivered) = msg
                                             .info()
@@ -275,9 +281,9 @@ pub async fn run_nats_jetstream(
                                     }
                                 },
                                 ProcessingStatus::ChannelClosed => return Err(()),
-                                // The payload does not decode and never will: redelivering it
-                                // would loop forever. The decoder has logged the error.
-                                ProcessingStatus::Failed => {
+                                // Nothing decoded and never will: redelivering it would loop
+                                // forever. The decoder has logged the error.
+                                ProcessingStatus::Failed { sent: false } => {
                                     if let Err(err) = msg.ack_with(AckKind::Term).await {
                                         error!(message = "Failed to terminate JetStream message.", %err);
                                     }
