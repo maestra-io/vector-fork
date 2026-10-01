@@ -9,9 +9,12 @@ Branch `maestra/v0.58` = upstream `v0.58.0` plus:
   error instead of the source silently stopping;
 - end-to-end acknowledgements in the `nats` source (upstream draft #26217, reworked): a message is
   acked when every ack-enabled sink accepted its events (for a disk buffer, after the buffer
-  write). `Errored` → delayed NAK (5 s × deliveries, max 60 s), `Rejected` and undecodable
-  payloads → TERM, in-flight acks are drained on graceful shutdown. Needs `ack_policy: explicit`,
-  and the consumer's `ack_wait` must exceed delivery-to-buffer-write latency;
+  write). `Errored` and `Rejected` → delayed NAK (5 s × deliveries, max 60 s); only payloads that do not
+  decode at all → TERM; in-flight acks are drained on graceful shutdown. `Rejected` is not
+  dropped because the sink driver reports exhausted retries as `Rejected`: a bounded
+  `retry_attempts` must never mean loss. Poison messages are bounded by the consumer's
+  `max_deliver` (alert on its MAX_DELIVERIES advisory). Needs `ack_policy: explicit`, and the
+  consumer's `ack_wait` must exceed delivery-to-buffer-write latency;
 - `.github/workflows/maestra.yml` instead of the upstream workflows: nats source tests against a
   real nats-server, then the image.
 
@@ -31,4 +34,6 @@ git cherry-pick <the maestra commits of maestra/v0.58>   # drop what upstream al
 # bump UPSTREAM_VERSION / IMAGE_VERSION (…-maestra.1) in .github/workflows/maestra.yml
 ```
 
-Local tests: `docker run -d -p 4222:4222 nats:2.12 -js`, then the `cargo test` line from the workflow.
+Local tests: `docker run -d -p 4222:4222 nats:2.12 -js`, then the `cargo test` line from the workflow
+and `tests/maestra/bounded-retries-e2e.sh <vector binary>` (real binary, http sink with
+`retry_attempts: 2`, endpoint down 40 s; 0.58.0-maestra.1 lost 2000/2000 there, maestra.2 0).

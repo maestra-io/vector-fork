@@ -26,7 +26,7 @@ env:
   # rebase onto a new upstream tag (and UPSTREAM in the Dockerfile), the right
   # half on every fork-only change. Quoted: a version scalar is a YAML float trap.
   UPSTREAM_VERSION: "0.58.0"
-  IMAGE_VERSION: "0.58.0-maestra.1"
+  IMAGE_VERSION: "0.58.0-maestra.2"
 
 jobs:
   test:
@@ -52,6 +52,10 @@ jobs:
           cargo test --locked --no-default-features --features nats-integration-tests
           --lib sources::nats -- --skip nats_userpass --skip nats_token --skip nats_nkey
           --skip nats_tls --skip nats_multiple_urls
+      - name: "E2E: bounded sink retries + sink down longer than them -> 0 loss"
+        run: |
+          cargo build --locked --no-default-features --features sources-nats,sinks-http --bin vector
+          tests/maestra/bounded-retries-e2e.sh target/debug/vector 2000 40
 
   image:
     needs: test

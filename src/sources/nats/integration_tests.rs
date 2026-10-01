@@ -1282,11 +1282,10 @@ async fn e2e_wait_settled(consumer: &async_nats::jetstream::consumer::PullConsum
     );
 }
 
-/// Delivered acks, Rejected terminates (no poison loop), Errored redelivers.
+/// Delivered acks; Rejected and Errored are redelivered (Rejected includes exhausted retries).
 #[tokio::test]
 async fn nats_jetstream_acks_follow_downstream_status() {
     use async_nats::jetstream::consumer::AckPolicy;
-    use futures::StreamExt;
 
     use crate::event::EventStatus;
 
@@ -1304,19 +1303,17 @@ async fn nats_jetstream_acks_follow_downstream_status() {
     e2e_wait_settled(&consumer).await;
     assert_eq!(probe.info().await.unwrap().ack_floor.stream_sequence, 1);
 
-    // Rejected: terminated, never redelivered although ack_wait (2s) passes.
+    // Rejected (e.g. a sink's retries ran out): NAKed and redelivered, never dropped.
     e2e_publish(&js, &conf.subject, "rejected".into()).await;
     let event = e2e_next(&mut rx).await;
     assert_eq!(e2e_message(&event), "rejected");
     event.metadata().update_status(EventStatus::Rejected);
     drop(event);
+    let event = e2e_next(&mut rx).await;
+    assert_eq!(e2e_message(&event), "rejected");
+    event.metadata().update_status(EventStatus::Delivered);
+    drop(event);
     e2e_wait_settled(&consumer).await;
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_secs(4), rx.next())
-            .await
-            .is_err(),
-        "a rejected message must not be redelivered"
-    );
 
     // Errored: NAKed with a delay and redelivered, then acked once delivered.
     e2e_publish(&js, &conf.subject, "errored".into()).await;
@@ -1505,6 +1502,59 @@ async fn nats_jetstream_decode_failures() {
         event.metadata().update_status(EventStatus::Delivered);
     }
     e2e_wait_settled(&consumer).await;
+
+    handle.abort();
+}
+
+/// Poison control is on the NATS side: with `max_deliver` set, a message that keeps
+/// failing downstream stops being redelivered and the server publishes a
+/// MAX_DELIVERIES advisory (what the consumers alert on).
+#[tokio::test]
+async fn nats_jetstream_max_deliver_bounds_a_failing_message() {
+    use async_nats::jetstream::consumer::AckPolicy;
+    use futures::StreamExt;
+
+    use crate::event::EventStatus;
+
+    let (js, consumer, conf) = e2e_ack_setup("js_e2e_maxdeliver", AckPolicy::Explicit).await;
+    let stream_name = conf.jetstream.as_ref().unwrap().stream.clone();
+    let consumer_name = conf.jetstream.as_ref().unwrap().consumer.clone();
+    let mut config = consumer.cached_info().config.clone();
+    config.max_deliver = 2;
+    js.get_stream(&stream_name)
+        .await
+        .unwrap()
+        .create_consumer(config)
+        .await
+        .unwrap();
+
+    let client = async_nats::connect(&conf.url).await.unwrap();
+    let mut advisories = client
+        .subscribe(format!(
+            "$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.{stream_name}.{consumer_name}"
+        ))
+        .await
+        .unwrap();
+
+    let (handle, mut rx) = e2e_source(&conf, true).await;
+    e2e_publish(&js, &conf.subject, "poison".into()).await;
+    for _ in 0..2 {
+        let event = e2e_next(&mut rx).await;
+        assert_eq!(e2e_message(&event), "poison");
+        event.metadata().update_status(EventStatus::Rejected);
+    }
+    let advisory = tokio::time::timeout(std::time::Duration::from_secs(30), advisories.next())
+        .await
+        .expect("no MAX_DELIVERIES advisory")
+        .unwrap();
+    let advisory: serde_json::Value = serde_json::from_slice(&advisory.payload).unwrap();
+    assert_eq!(advisory["stream_seq"], 1);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(8), rx.next())
+            .await
+            .is_err(),
+        "no redelivery past max_deliver"
+    );
 
     handle.abort();
 }

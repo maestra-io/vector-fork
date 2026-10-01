@@ -164,22 +164,23 @@ impl std::fmt::Debug for PendingAck {
     }
 }
 
-/// Upper bound of the redelivery delay for an errored batch.
+/// Upper bound of the redelivery delay for a failed batch.
 const MAX_NAK_DELAY: Duration = Duration::from_secs(60);
 
 /// Maps the downstream outcome of a delivery to the JetStream ack sent for it.
 ///
-/// `Errored` is transient (retries exhausted), so the message is redelivered, later the more
-/// often it has failed; the consumer's `max_deliver` bounds the attempts. `Rejected` is a sink's
-/// permanent verdict: redelivering would loop forever, so the message is terminated.
+/// `Errored` and `Rejected` are both NAKed for redelivery, later the more often the message has
+/// failed. `Rejected` is not a safe "drop it" signal: the sink driver reports a request whose
+/// retries ran out as `Rejected` (`vector-stream` `Driver::handle_response`), so with a bounded
+/// `retry_attempts` a sink outage would otherwise lose data. Poison messages are bounded on the
+/// NATS side instead, by the consumer's `max_deliver` (and its MAX_DELIVERIES advisory).
 fn ack_kind(status: BatchStatus, delivered: i64) -> AckKind {
     match status {
         BatchStatus::Delivered => AckKind::Ack,
-        BatchStatus::Errored => {
+        BatchStatus::Errored | BatchStatus::Rejected => {
             let secs = 5u64.saturating_mul(delivered.max(1) as u64);
             AckKind::Nak(Some(Duration::from_secs(secs).min(MAX_NAK_DELAY)))
         }
-        BatchStatus::Rejected => AckKind::Term,
     }
 }
 
@@ -187,13 +188,9 @@ async fn finalize(status: BatchStatus, entry: PendingAck) {
     let kind = ack_kind(status, entry.delivered);
     match status {
         BatchStatus::Delivered => {}
-        BatchStatus::Errored => warn!(
-            message = "Delivery of a JetStream message errored downstream, redelivering.",
-            stream_sequence = entry.stream_sequence,
-            delivered = entry.delivered,
-        ),
-        BatchStatus::Rejected => error!(
-            message = "JetStream message rejected downstream, terminating it.",
+        BatchStatus::Errored | BatchStatus::Rejected => warn!(
+            message = "Delivery of a JetStream message failed downstream, redelivering.",
+            ?status,
             stream_sequence = entry.stream_sequence,
             delivered = entry.delivered,
         ),
@@ -435,20 +432,17 @@ mod tests {
     }
 
     #[test]
-    fn rejected_is_terminated_not_redelivered() {
-        assert!(matches!(ack_kind(BatchStatus::Rejected, 1), AckKind::Term));
-        assert!(matches!(ack_kind(BatchStatus::Rejected, 50), AckKind::Term));
-    }
-
-    #[test]
-    fn errored_is_nakked_with_growing_capped_delay() {
-        let delay = |delivered| match ack_kind(BatchStatus::Errored, delivered) {
-            AckKind::Nak(Some(delay)) => delay,
-            _ => panic!("errored must be a delayed NAK"),
-        };
-        assert_eq!(delay(0), Duration::from_secs(5));
-        assert_eq!(delay(1), Duration::from_secs(5));
-        assert_eq!(delay(3), Duration::from_secs(15));
-        assert_eq!(delay(1000), MAX_NAK_DELAY);
+    fn failures_are_nakked_with_growing_capped_delay() {
+        // Rejected included: retries-exhausted is reported as Rejected, so TERM would lose data.
+        for status in [BatchStatus::Errored, BatchStatus::Rejected] {
+            let delay = |delivered| match ack_kind(status, delivered) {
+                AckKind::Nak(Some(delay)) => delay,
+                _ => panic!("{status:?} must be a delayed NAK"),
+            };
+            assert_eq!(delay(0), Duration::from_secs(5));
+            assert_eq!(delay(1), Duration::from_secs(5));
+            assert_eq!(delay(3), Duration::from_secs(15));
+            assert_eq!(delay(1000), MAX_NAK_DELAY);
+        }
     }
 }
