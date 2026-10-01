@@ -95,8 +95,8 @@ pub struct JetStreamConfig {
     /// policy. A message is acknowledged only after every connected sink has accepted its events
     /// (for a sink with a disk buffer, after the buffer write), so the consumer's `ack_wait` must
     /// cover the worst-case time from delivery to that point, or the message is redelivered.
-    /// Messages rejected by a sink are terminated; errored ones are negatively acknowledged for
-    /// redelivery, bounded by the consumer's `max_deliver`.
+    /// Messages a sink errored or rejected (which includes exhausted retries) are negatively
+    /// acknowledged for redelivery; set the consumer's `max_deliver` to bound poison messages.
     pub consumer: String,
 
     #[serde(default)]
