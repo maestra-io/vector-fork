@@ -137,8 +137,12 @@ jobs:
 
           # Image-build ECR repositories are created by CI, not terraform
           # (aws-infra ecr-eu-forget.tf); the org-wide pull policy is set on every run.
+          # Release tags are immutable: a different image pushed under an existing
+          # tag is rejected (TAG_INVALID), the identical one still succeeds. On
+          # 2026-10-09 a re-minted release number silently overwrote released images.
           aws ecr describe-repositories --repository-names ${{ env.IMAGE_NAME }} --region ${{ env.AWS_REGION }} >/dev/null 2>&1 || \
-            aws ecr create-repository --repository-name ${{ env.IMAGE_NAME }} --region ${{ env.AWS_REGION }} >/dev/null
+            aws ecr create-repository --repository-name ${{ env.IMAGE_NAME }} --region ${{ env.AWS_REGION }} \
+              --image-tag-mutability IMMUTABLE >/dev/null
           aws ecr set-repository-policy --repository-name ${{ env.IMAGE_NAME }} --region ${{ env.AWS_REGION }} \
             --policy-text file://.github/ecr-policy.json >/dev/null
 
